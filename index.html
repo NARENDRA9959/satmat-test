@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Satmat Verification</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1b2430; --muted:#6b7686; --line:#e3e7ee; --brand:#0b5fff; --bad:#c62828; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:860px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:560px){ .grid{grid-template-columns:1fr;} }
+  label { display:block; font-size:13px; font-weight:600; margin-bottom:4px; }
+  input[type=text], input[type=tel], input[type=date], select { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; color:var(--ink); }
+  input:focus, select:focus { outline:2px solid var(--brand); outline-offset:1px; }
+  .full { grid-column:1/-1; }
+  .consent { display:flex; gap:10px; align-items:flex-start; font-size:13px; color:var(--muted); font-weight:400; }
+  .consent input { margin-top:3px; }
+  button { font:inherit; font-weight:600; border:0; border-radius:8px; padding:11px 18px; cursor:pointer; background:var(--brand); color:#fff; }
+  button.secondary { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .msg { padding:12px 14px; border-radius:8px; font-size:14px; margin-top:12px; }
+  .msg.err { background:#fdecea; color:var(--bad); }
+  .msg.info { background:#eaf1ff; color:#16408f; }
+  .score { display:flex; align-items:baseline; gap:12px; }
+  .score b { font-size:48px; line-height:1; }
+  .pill { font-size:12px; padding:3px 9px; border-radius:99px; background:#eef1f6; color:var(--muted); }
+  h2 { font-size:16px; margin:0 0 10px; }
+  details { border-top:1px solid var(--line); padding:6px 0; }
+  details > summary { cursor:pointer; font-weight:600; font-size:14px; padding:4px 0; }
+  details > .body { padding-left:14px; }
+  .kv { display:grid; grid-template-columns:minmax(120px,220px) 1fr; gap:3px 12px; font-size:13.5px; margin:4px 0; }
+  .kv .k { color:var(--muted); word-break:break-word; }
+  .kv .v { word-break:break-word; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin:6px 0; }
+  th, td { text-align:left; padding:6px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .scroll { overflow-x:auto; }
+  .hidden { display:none; }
+  @media print { body{background:#fff;} .noprint{display:none!important;} .card{border:0;padding:0;} }
+</style>
+</head>
+<body>
+<main>
+  <h1>Satmat Verification</h1>
+  <p class="sub noprint">Pick a service, enter the details, fetch the result, and download it.</p>
+
+  <form id="form" class="card noprint" novalidate>
+    <div class="grid">
+      <div class="full"><label for="service">Service</label><select id="service"></select></div>
+      <div id="fields" class="full grid" style="padding:0"></div>
+      <label class="consent full"><input id="consent" type="checkbox"> I confirm I have the person's consent or a lawful purpose to run this check.</label>
+      <div class="full row"><button id="submit" type="submit">Fetch</button><button id="reset" type="button" class="secondary">Clear</button></div>
+    </div>
+    <div id="status" class="msg hidden"></div>
+  </form>
+
+  <section id="report" class="hidden">
+    <div class="card noprint row">
+      <button id="dl-pdf">Download PDF</button>
+      <button id="dl-json" class="secondary">Download JSON</button>
+      <button id="print" class="secondary">Print</button>
+    </div>
+    <div id="headline" class="card hidden"><div class="score"><b id="score"></b><div><div id="scoreName" class="pill"></div></div></div></div>
+    <div class="card"><h2 id="resultTitle">Result</h2><div id="tree"></div></div>
+    <p class="sub" id="meta"></p>
+  </section>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+  const get = (o, p) => p.split('.').reduce((a, k) => (a == null ? undefined : a[k]), o);
+
+  // Where each service puts its headline score in the response.
+  const HEADLINE = {
+    transunion: { path: 'data.result.cibilData.GetCustomerAssetsResponse.GetCustomerAssetsSuccess.Asset.TrueLinkCreditReport.Borrower.CreditScore.riskScore', label: 'CIBIL / TransUnion score' },
+    experian:   { path: 'data.result.result_json.INProfileResponse.SCORE.BureauScore', label: 'Experian bureau score' },
+    crif:       { path: 'data.result.result_json.credit_report.scores.score_value', label: 'CRIF score' },
+    mobile_addr:{ path: 'data.result.score', label: 'Score' },
+  };
+
+  let services = [], current = null, lastResponse = null, lastKey = null, pruned = null;
+
+  function setStatus(text, kind) { const el = $('status'); el.className = 'msg ' + kind; el.textContent = text; }
+  const clearStatus = () => { $('status').className = 'msg hidden'; };
+
+  // ----- form -----
+  function buildFields() {
+    current = services.find((s) => s.key === $('service').value);
+    const box = $('fields');
+    box.textContent = '';
+    current.fields.forEach((f) => {
+      const wrap = document.createElement('div');
+      if (f.name === 'address') wrap.className = 'full';
+      const lab = document.createElement('label'); lab.textContent = f.label; lab.htmlFor = 'f_' + f.name;
+      let inp;
+      if (f.type === 'select') {
+        inp = document.createElement('select');
+        const o0 = document.createElement('option'); o0.value = ''; o0.textContent = 'Select…'; inp.appendChild(o0);
+        f.options.forEach((o) => { const op = document.createElement('option'); op.value = o.value; op.textContent = o.label + ' (' + o.value + ')'; inp.appendChild(op); });
+      } else {
+        inp = document.createElement('input');
+        inp.type = f.type === 'date' ? 'date' : f.type === 'tel' ? 'tel' : 'text';
+        inp.autocomplete = 'off';
+        if (f.placeholder) inp.placeholder = f.placeholder;
+        if (f.digits) inp.maxLength = f.digits + (f.digits === 10 ? 3 : 0);
+        if (f.digits) inp.inputMode = 'numeric';
+        if (f.upper) inp.style.textTransform = 'uppercase';
+        inp.addEventListener('input', () => {
+          if (f.upper) inp.value = inp.value.toUpperCase().replace(/[^A-Z0-9 -]/g, '');
+          if (f.digits && f.digits !== 10) inp.value = inp.value.replace(/\D/g, '');
+        });
+      }
+      inp.id = 'f_' + f.name; inp.dataset.name = f.name;
+      wrap.append(lab, inp); box.appendChild(wrap);
+    });
+  }
+
+  $('service').addEventListener('change', () => { buildFields(); clearStatus(); $('report').classList.add('hidden'); });
+  $('reset').addEventListener('click', () => {
+    $('consent').checked = false; buildFields(); clearStatus(); $('report').classList.add('hidden'); lastResponse = null;
+  });
+
+  $('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearStatus();
+    const body = { consent: $('consent').checked };
+    document.querySelectorAll('#fields [data-name]').forEach((el) => { body[el.dataset.name] = el.value.trim(); });
+    const btn = $('submit'); btn.disabled = true; btn.textContent = 'Fetching…';
+    setStatus('Contacting Satmat — this can take up to a minute.', 'info');
+    $('report').classList.add('hidden');
+    try {
+      const res = await fetch('/api/run/' + current.key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch { throw new Error('Unexpected response (HTTP ' + res.status + ').'); }
+      if (!res.ok || json.status !== true) {
+        const inner = json.data && json.data.message;
+        throw new Error(inner && /no record|not found/i.test(json.message || '') ? inner : (json.message || 'Request failed (HTTP ' + res.status + ').'));
+      }
+      lastResponse = json; lastKey = current.key;
+      render(json);
+      clearStatus();
+    } catch (err) {
+      setStatus(err.message, 'err');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Fetch';
+    }
+  });
+
+  // ----- result rendering -----
+  const SKIP_KEYS = new Set(['Source', 'OriginalData', 'xml_file']); // noisy / huge; still present in the JSON download
+  function prune(v) {
+    if (Array.isArray(v)) { const a = v.map(prune).filter((x) => x !== undefined); return a.length ? a : undefined; }
+    if (isObj(v)) {
+      const o = {};
+      Object.keys(v).forEach((k) => { if (SKIP_KEYS.has(k)) return; const p = prune(v[k]); if (p !== undefined) o[k] = p; });
+      // collapse bureau {symbol,description,rank,abbreviation} wrappers to one value
+      const ks = Object.keys(o);
+      if (ks.length && ks.every((k) => ['symbol', 'description', 'rank', 'abbreviation'].includes(k))) return o.description || o.symbol || undefined;
+      return ks.length ? o : undefined;
+    }
+    if (v === null || v === '' || v === undefined) return undefined;
+    return v;
+  }
+  const label = (k) => String(k).replace(/_/g, ' ');
+  const isFlatRow = (o) => isObj(o) && Object.values(o).every((x) => !isObj(x) && !Array.isArray(x));
+
+  function renderValue(parent, key, val, depth) {
+    if (Array.isArray(val)) {
+      if (val.every((x) => !isObj(x) && !Array.isArray(x))) return kvRow(parent, key, val.join(', '));
+      if (val.every(isFlatRow)) {
+        const cols = [...new Set(val.flatMap(Object.keys))];
+        const d = group(parent, label(key) + ' (' + val.length + ')', depth);
+        const wrap = document.createElement('div'); wrap.className = 'scroll';
+        const t = document.createElement('table');
+        const hr = t.createTHead().insertRow();
+        cols.forEach((c) => { const th = document.createElement('th'); th.textContent = label(c); hr.appendChild(th); });
+        const tb = t.createTBody();
+        val.forEach((r) => { const tr = tb.insertRow(); cols.forEach((c) => { tr.insertCell().textContent = r[c] == null ? '' : String(r[c]); }); });
+        wrap.appendChild(t); d.appendChild(wrap); return;
+      }
+      val.forEach((item, i) => renderValue(parent, key + ' ' + (i + 1), item, depth));
+      return;
+    }
+    if (isObj(val)) {
+      const d = group(parent, label(key), depth);
+      const prim = Object.keys(val).filter((k) => !isObj(val[k]) && !Array.isArray(val[k]));
+      prim.forEach((k) => kvRow(d, k, val[k]));
+      Object.keys(val).filter((k) => !prim.includes(k)).forEach((k) => renderValue(d, k, val[k], depth + 1));
+      return;
+    }
+    kvRow(parent, key, val);
+  }
+  function group(parent, title, depth) {
+    const det = document.createElement('details'); if (depth < 2) det.open = true;
+    const sm = document.createElement('summary'); sm.textContent = title; det.appendChild(sm);
+    const body = document.createElement('div'); body.className = 'body'; det.appendChild(body);
+    parent.appendChild(det); return body;
+  }
+  function kvRow(parent, k, v) {
+    const row = document.createElement('div'); row.className = 'kv';
+    const a = document.createElement('span'); a.className = 'k'; a.textContent = label(k);
+    const b = document.createElement('span'); b.className = 'v'; b.textContent = String(v);
+    row.append(a, b); parent.appendChild(row);
+  }
+
+  function render(json) {
+    const svc = services.find((s) => s.key === lastKey);
+    $('resultTitle').textContent = svc.label;
+    const h = HEADLINE[lastKey], score = h && get(json, h.path);
+    $('headline').classList.toggle('hidden', score == null);
+    if (score != null) { $('score').textContent = score; $('scoreName').textContent = h.label; }
+
+    const data = json.data !== undefined ? json.data : json;
+    pruned = prune(data) || {};
+    const tree = $('tree'); tree.textContent = '';
+    if (isObj(pruned)) {
+      const prim = Object.keys(pruned).filter((k) => !isObj(pruned[k]) && !Array.isArray(pruned[k]));
+      prim.forEach((k) => kvRow(tree, k, pruned[k]));
+      Object.keys(pruned).filter((k) => !prim.includes(k)).forEach((k) => renderValue(tree, k, pruned[k], 0));
+    } else { kvRow(tree, 'result', pruned); }
+    $('meta').textContent = ['Ref ' + (json.reference_number || '–'), json.request_id ? 'Request ' + json.request_id : '', 'Fetched ' + new Date().toLocaleString()].filter(Boolean).join(' · ');
+    $('report').classList.remove('hidden');
+    $('report').scrollIntoView({ behavior: 'smooth' });
+  }
+
+  // ----- downloads -----
+  function save(blob, name) {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+  const stamp = () => new Date().toISOString().slice(0, 10);
+  $('dl-json').addEventListener('click', () => { if (lastResponse) save(new Blob([JSON.stringify(lastResponse, null, 2)], { type: 'application/json' }), lastKey + '-' + stamp() + '.json'); });
+  $('print').addEventListener('click', () => { document.querySelectorAll('#tree details').forEach((d) => { d.open = true; }); window.print(); });
+
+  $('dl-pdf').addEventListener('click', () => {
+    if (!pruned) return;
+    if (!window.jspdf) { setStatus('PDF library failed to load — use Print and "Save as PDF".', 'err'); return; }
+    const svc = services.find((s) => s.key === lastKey);
+    const doc = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4' });
+    const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), M = 40;
+    let y = M;
+    const need = (h) => { if (y + h > H - M) { doc.addPage(); y = M; } };
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.text(svc.label, M, y); y += 22;
+    const h = HEADLINE[lastKey], score = h && get(lastResponse, h.path);
+    if (score != null) { doc.setFontSize(28); doc.text(String(score), M, y + 10); doc.setFontSize(10); doc.setFont('helvetica', 'normal'); doc.setTextColor(110); doc.text(h.label, M + 80, y + 8); doc.setTextColor(20); y += 36; }
+
+    const colW = 170;
+    function walk(key, val, depth) {
+      const x = M + depth * 12;
+      if (Array.isArray(val)) {
+        if (val.every((v) => !isObj(v) && !Array.isArray(v))) return line(key, val.join(', '), x);
+        val.forEach((it, i) => walk(key + ' ' + (i + 1), it, depth));
+        return;
+      }
+      if (isObj(val)) {
+        need(24); y += 4; doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(20);
+        doc.text(label(key), x, y); y += 14;
+        Object.keys(val).forEach((k) => walk(k, val[k], depth + 1));
+        return;
+      }
+      line(key, val, x);
+    }
+    function line(k, v, x) {
+      const lines = doc.splitTextToSize(String(v), W - M - (x + colW));
+      need(14 * lines.length);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+      doc.setTextColor(110); doc.text(doc.splitTextToSize(label(k), colW - 8)[0], x, y);
+      doc.setTextColor(20); doc.text(lines, x + colW, y); y += 12 * lines.length + 2;
+    }
+    if (isObj(pruned)) Object.keys(pruned).forEach((k) => walk(k, pruned[k], 0)); else line('result', pruned, M);
+    need(30); y += 10; doc.setFontSize(8); doc.setTextColor(120);
+    doc.text($('meta').textContent, M, y, { maxWidth: W - M * 2 });
+    doc.save(lastKey + '-' + stamp() + '.pdf');
+  });
+
+  // ----- init -----
+  fetch('/api/services').then((r) => r.json()).then((list) => {
+    services = list;
+    const sel = $('service'); const groups = {};
+    list.forEach((s) => {
+      if (!groups[s.group]) { groups[s.group] = document.createElement('optgroup'); groups[s.group].label = s.group; sel.appendChild(groups[s.group]); }
+      const o = document.createElement('option'); o.value = s.key; o.textContent = s.label; groups[s.group].appendChild(o);
+    });
+    buildFields();
+  }).catch(() => setStatus('Could not load services. Is server.js running?', 'err'));
+})();
+</script>
+</body>
+</html>
